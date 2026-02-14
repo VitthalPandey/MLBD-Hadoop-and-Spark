@@ -1,0 +1,144 @@
+
+#Step 1: Loading 
+
+import os
+import sys
+from pyspark.sql.functions import input_file_name
+
+# Get path from env variable
+base_path = os.environ.get("GUTENBERG_ROOT")
+if not base_path:
+    print("Error: GUTENBERG_ROOT not set")
+    sys.exit(1)
+
+# Build path
+input_path = f"file://{base_path}/*.txt"
+
+# Read all text files
+df_all = spark.read.text(input_path).withColumn("file_name", input_file_name())
+
+# Check
+df_all.show(3, truncate=100)
+
+
+#Step 2: Limit dataset
+from pyspark.sql.functions import col
+
+# Keep the target book (10.txt)
+target_book = df_all.filter(col("file_name").contains("10.txt"))
+
+# Limit other books to 99 (for memory safety)
+other_books = df_all.filter(~col("file_name").contains("10.txt")).limit(99)
+
+# Union target + sampled books
+df = target_book.union(other_books)
+
+# Check
+df.select("file_name").distinct().show(5, truncate=False)
+
+
+#step 3: Combine all lines into single text per book
+from pyspark.sql.functions import concat_ws, collect_list
+
+# Group lines by book
+full_text_df = df.groupBy("file_name") \
+    .agg(concat_ws(" ", collect_list("value")).alias("text"))
+
+# Check
+full_text_df.show(3, truncate=200)
+
+
+#Step 4: Clean the text
+from pyspark.sql.functions import lower, regexp_replace
+
+clean_df = full_text_df.withColumn(
+    "clean_text",
+    regexp_replace(lower(col("text")), r"[^a-z\s]", "")  # lowercase & remove punctuation
+)
+
+# Check
+clean_df.select("file_name", "clean_text").show(2, truncate=200)
+
+#Step 5: Tokenize the text
+from pyspark.ml.feature import Tokenizer
+
+# Tokenize clean_text into words
+tokenizer = Tokenizer(inputCol="clean_text", outputCol="words")
+books_tokenized = tokenizer.transform(clean_df)
+
+# Check
+books_tokenized.select("file_name", "words").show(2, truncate=100)
+
+
+#Step 6: Remove stop words
+from pyspark.ml.feature import StopWordsRemover
+
+# Remove common English stop words
+remover = StopWordsRemover(inputCol="words", outputCol="filtered_words")
+books_filtered = remover.transform(books_tokenized)
+
+# Check
+books_filtered.select("file_name", "filtered_words").show(2, truncate=100)
+
+
+#Step 7: Compute TF using HashingTF
+
+from pyspark.ml.feature import HashingTF
+
+hashingTF = HashingTF(inputCol="filtered_words", outputCol="rawFeatures", numFeatures=1000)
+books_tf = hashingTF.transform(books_filtered)
+
+# Check
+books_tf.select("file_name", "rawFeatures").show(2, truncate=100)
+
+
+#Step 8: Compute IDF and TF-IDF
+
+from pyspark.ml.feature import IDF
+
+idf = IDF(inputCol="rawFeatures", outputCol="features")
+idf_model = idf.fit(books_tf)        # Learn IDF from all books
+books_tfidf = idf_model.transform(books_tf)
+
+# Check
+books_tfidf.select("file_name", "features").show(2, truncate=100)
+
+
+#Step 9: Normalize vectors for cosine similarity
+
+from pyspark.ml.feature import Normalizer
+
+normalizer = Normalizer(inputCol="features", outputCol="normFeatures")
+norm_df = normalizer.transform(books_tfidf).select("file_name", "normFeatures")
+
+# Check
+norm_df.show(2, truncate=100)
+
+
+#Step 10: Compute cosine similarity
+
+from pyspark.sql.functions import col, udf
+from pyspark.sql.types import DoubleType
+
+# Define cosine similarity UDF
+cosine_udf = udf(lambda x, y: float(x.dot(y)), DoubleType())
+
+# Compute pairwise similarity (cross join, but safe since we limited to 100 books)
+similarity_df = norm_df.alias("a").crossJoin(norm_df.alias("b")) \
+    .filter(col("a.file_name") != col("b.file_name")) \
+    .withColumn("similarity", cosine_udf(col("a.normFeatures"), col("b.normFeatures")))
+
+# Check
+similarity_df.select("a.file_name", "b.file_name", "similarity").show(5, truncate=False)
+
+
+#Step 11: Top 5 similar books for "10.txt"
+
+similarity_df.filter(col("a.file_name").contains("10.txt")) \
+             .orderBy(col("similarity").desc()) \
+             .select(col("b.file_name"), col("similarity")) \
+             .show(5, truncate=False)
+
+
+
+
